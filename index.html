@@ -315,11 +315,12 @@
   // call tracking
   let currentCallId = null;
   let currentCallPeer = null; // who we're in call with (or ringing)
-  let incomingRef = null;         // incoming/<myId> global (keeps attached after login)
-  let answerRef = null;           // answers/<caller>/<callee> per-call
-  let remoteCandidatesRef = null; // candidates/<myId>/<peer> per-call
-  let callStatusRef = null;       // calls/<callId> per-call
-  let callTimeoutHandle = null;   // local 30s timer handle
+  let incomingRefUnsub = null;         // unsubscribe function for incoming/<myId>
+  let answerRefUnsub = null;           // unsubscribe for answers/<caller>/<callee>
+  let remoteCandidatesUnsub = null;    // unsubscribe for candidates
+  let callStatusUnsub = null;          // unsubscribe for calls/<callId>
+  let callTimeoutHandle = null;        // local 30s timer handle
+  let currentIncomingOfferId = null;   // to ensure incoming modal maps to active offer
 
   // UI elements
   const callBar = document.getElementById('callBar');
@@ -335,6 +336,11 @@
   const incomingText = document.getElementById('incomingText');
   const acceptCallBtn = document.getElementById('acceptCallBtn');
   const rejectCallBtn = document.getElementById('rejectCallBtn');
+
+  /* ------------------ Utility: unsubscribe helpers ------------------ */
+  function safeUnsub(unsub) {
+    try { if (typeof unsub === 'function') unsub(); } catch(e){}
+  }
 
   /* ------------------ App logic (kept same) ------------------ */
   function showSection(id) {
@@ -359,7 +365,6 @@
 
   /* ------------------ Helper: call-state utilities ------------------ */
 
-  // mark a user's callState (used to check busy state)
   async function setCallState(userId, stateObj) {
     try {
       await set(ref(db, `callState/${userId}`), { ...stateObj, updated: Date.now() });
@@ -368,19 +373,28 @@
     }
   }
 
-  // read a user's callState and incoming node to determine busy
+  async function getCallState(userId) {
+    try {
+      const snap = await get(ref(db, `callState/${userId}`));
+      return snap.exists() ? snap.val() : null;
+    } catch(e) {
+      return null;
+    }
+  }
+
   async function isUserBusy(userId) {
     try {
-      const [csSnap, incSnap, callsSnap] = await Promise.all([
-        get(ref(db, `callState/${userId}`)),
-        get(ref(db, `incoming/${userId}`)),
-        get(ref(db, `calls`))
-      ]);
+      // quick presence check
+      const csSnap = await get(ref(db, `callState/${userId}`));
       if (csSnap.exists()) {
         const cs = csSnap.val();
         if (cs.status && cs.status !== 'idle') return true;
       }
-      if (incSnap.exists()) return true; // someone is calling them (incoming/<userId>)
+      // incoming node presence
+      const incSnap = await get(ref(db, `incoming/${userId}`));
+      if (incSnap.exists()) return true;
+      // check calls list for any active call involving user
+      const callsSnap = await get(ref(db, `calls`));
       if (callsSnap.exists()) {
         const callsObj = callsSnap.val();
         for (const k in callsObj) {
@@ -433,7 +447,9 @@
     if (snap.exists()) { alert("ID already exists, try generating again"); return; }
     await set(userRef, { password, nickname });
     showSection("successPage");
-  };window.loginUser = async () => {
+  };
+
+  window.loginUser = async () => {
     const id = document.getElementById("loginId").value.trim();
     const password = document.getElementById("loginPassword").value;
     if (!id || !password) return alert("Enter ID and password");
@@ -558,7 +574,7 @@
     msgInput.value = "";
   };
 
-  /* ----------------- CALLING / WebRTC functions (behavior fixes) ----------------- */
+  /* ----------------- CALLING / WebRTC functions (fixed behavior) ----------------- */
 
   // create RTCPeerConnection and wire handlers
   function createPeerConnection(targetId) {
@@ -581,6 +597,10 @@
 
     pc.onconnectionstatechange = () => {
       console.log('pc state', pc ? pc.connectionState : 'no-pc');
+      // if connection failed, ensure cleanup
+      if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed')) {
+        // mark ended locally; callStatus listener will handle DB cleanup
+      }
     };
 
     return pc;
@@ -588,10 +608,11 @@
 
   // listen for remote ICE candidates for calls targeted to me from a specific peer
   function listenForRemoteCandidates(fromId) {
-    // candidates/<currentUserId>/<fromId>
-    if (remoteCandidatesRef) { off(remoteCandidatesRef); remoteCandidatesRef = null; }
-    remoteCandidatesRef = ref(db, `candidates/${currentUserId}/${fromId}`);
-    onChildAdded(remoteCandidatesRef, async (snap) => {
+    // detach previous
+    safeUnsub(remoteCandidatesUnsub);
+    const candidatesRef = ref(db, `candidates/${currentUserId}/${fromId}`);
+    // onChildAdded returns unsubscribe in modular SDK only via onChildAdded wrapper; we wrap onValue and filter new child keys
+    remoteCandidatesUnsub = onChildAdded(candidatesRef, async (snap) => {
       const cand = snap.val();
       if (!cand || !pc) return;
       try { await pc.addIceCandidate(cand); } catch(e){ console.warn('addIce err', e); }
@@ -601,15 +622,19 @@
   // helper to attach call status listener
   function attachCallStatusListener(callId) {
     if (!callId) return;
-    if (callStatusRef) { off(callStatusRef); callStatusRef = null; }
-    callStatusRef = ref(db, `calls/${callId}`);
-    onValue(callStatusRef, async (snap) => {
+    safeUnsub(callStatusUnsub);
+    const callStatusRefLocal = ref(db, `calls/${callId}`);
+    callStatusUnsub = onValue(callStatusRefLocal, async (snap) => {
       if (!snap.exists()) return;
       const data = snap.val();
       if (!data || !data.status) return;
-      if (data.status === 'ended' || data.status === 'cancelled' || data.status === 'no-answer' || data.status === 'busy') {
+      const s = data.status;
+      if (s === 'ended' || s === 'cancelled' || s === 'no-answer' || s === 'busy' || s === 'rejected') {
         // remote ended or call ended — cleanup locally
         await localCleanupAfterCall(false);
+      } else if (s === 'connected') {
+        // remote side accepted -> ensure preview stays and we are marked in-call
+        try { await setCallState(currentUserId, { status: 'in-call', peer: currentCallPeer, callId: callId }); } catch(e){}
       }
     });
   }
@@ -636,7 +661,7 @@
       return alert('Permission required: ' + e.message);
     }
 
-    // show preview area
+    // show preview area and keep it visible until explicit cleanup
     showPreviewArea(media);
 
     // create unique call id
@@ -644,7 +669,7 @@
     currentCallId = callId;
     currentCallPeer = currentChatFriend;
 
-    // mark caller callState as 'calling' (so UI/others know)
+    // mark caller callState as 'calling'
     try { await setCallState(currentUserId, { status: 'calling', peer: currentChatFriend, callId }); } catch(e){}
 
     createPeerConnection(currentChatFriend);
@@ -657,14 +682,20 @@
     await set(ref(db, `incoming/${currentChatFriend}`), { from: currentUserId, sdp: offer.sdp, type: offer.type, media: media, timestamp: Date.now(), callId });
     await set(ref(db, `calls/${callId}`), { caller: currentUserId, callee: currentChatFriend, status: 'ringing', timestamp: Date.now(), expiresAt: Date.now() + 30000 });
 
-    // listen for answer (answers/<caller>/<callee>)
-    if (answerRef) { off(answerRef); answerRef = null; }
-    answerRef = ref(db, `answers/${currentUserId}/${currentChatFriend}`);
-    onValue(answerRef, async (snap) => {
+    // listen for answer
+    safeUnsub(answerRefUnsub);
+    const answerRefLocal = ref(db, `answers/${currentUserId}/${currentChatFriend}`);
+    answerRefUnsub = onValue(answerRefLocal, async (snap) => {
       if (!snap.exists()) return;
       const ans = snap.val();
       if (ans && ans.sdp) {
-        try { await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp }); } catch (e) { console.warn('setRemoteDesc error', e); }
+        try {
+          await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp });
+          // mark both sides in-call in DB
+          try { await setCallState(currentUserId, { status: 'in-call', peer: currentChatFriend, callId: currentCallId }); } catch(e){}
+          try { await setCallState(currentChatFriend, { status: 'in-call', peer: currentUserId, callId: currentCallId }); } catch(e){}
+          try { await update(ref(db, `calls/${currentCallId}`), { status: 'connected' }); } catch(e){}
+        } catch (e) { console.warn('setRemoteDesc error', e); }
       }
     });
 
@@ -674,18 +705,16 @@
     // listen for call status changes
     attachCallStatusListener(callId);
 
-    // set a 30s auto-reject timeout
+    // set a 30s auto-reject timeout (caller-side guard)
     if (callTimeoutHandle) { clearTimeout(callTimeoutHandle); callTimeoutHandle = null; }
     callTimeoutHandle = setTimeout(async () => {
       try {
         const cSnap = await get(ref(db, `calls/${callId}`));
         if (!cSnap.exists()) return;
         const c = cSnap.val();
-        if (c.status === 'ringing') {
-          // mark no-answer + cleanup both sides
+        if (c && c.status === 'ringing') {
           try { await update(ref(db, `calls/${callId}`), { status: 'no-answer' }); } catch(e){}
           try { await remove(ref(db, `incoming/${currentChatFriend}`)); } catch(e){}
-          // reset callState for caller and callee
           try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
           try { await setCallState(currentChatFriend, { status: 'idle' }); } catch(e){}
           await localCleanupAfterCall(true);
@@ -698,26 +727,31 @@
     callBar.style.display = 'none';
   }
 
-  // incoming listener stays attached after login; do not detach on hangup
+  // incoming listener remains attached after login
   function startIncomingListener() {
     if (!currentUserId) return;
-    if (incomingRef) { off(incomingRef); incomingRef = null; }
-    incomingRef = ref(db, `incoming/${currentUserId}`);
-    onValue(incomingRef, async (snap) => {
+    safeUnsub(incomingRefUnsub);
+    const incomingRefLocal = ref(db, `incoming/${currentUserId}`);
+    incomingRefUnsub = onValue(incomingRefLocal, async (snap) => {
       if (!snap.exists()) {
-        incomingModal.style.display = 'none';
+        // only hide modal if there is no active incoming matching the currentIncomingOfferId
+        // and we are not in-call
+        if (!currentCallId) incomingModal.style.display = 'none';
+        currentIncomingOfferId = null;
         return;
       }
       const offer = snap.val();
       if (!offer || !offer.from) return;
 
-      // If we're already in a call or busy, auto-reject by updating call status and removing incoming
-      if (currentCallId || (await isUserBusy(currentUserId))) {
+      // If we're already in a call or busy, mark caller's call as 'busy' and remove incoming
+      const busy = currentCallId || (await isUserBusy(currentUserId));
+      if (busy) {
         try { await update(ref(db, `calls/${offer.callId}`), { status: 'busy' }); } catch(e){}
         try { await remove(ref(db, `incoming/${currentUserId}`)); } catch(e){}
         return;
-  }
-            // safety: if call already expired, clear it
+      }
+
+      // safety: if call already expired, clear it
       try {
         const callSnap = await get(ref(db, `calls/${offer.callId}`));
         if (callSnap.exists()) {
@@ -730,34 +764,33 @@
         }
       } catch (e) { /* ignore */ }
 
-      // show incoming modal with caller info
-      const callerId = offer.from;
-      const callerSnap = await get(ref(db, `users/${callerId}`));
-      const callerName = callerSnap.exists() ? callerSnap.val().nickname : callerId;
-      incomingText.innerText = `Incoming ${offer.media || 'audio'} call from ${callerName} (${callerId})`;
+      // show incoming modal and keep track of this offer id so we don't hide it incorrectly
+      currentIncomingOfferId = offer.callId || `${offer.timestamp}_${offer.from}`;
+      incomingText.innerText = `Incoming ${offer.media || 'audio'} call from ${offer.from}`;
       incomingModal.style.display = 'block';
 
+      const callerId = offer.from;
       // accept
       acceptCallBtn.onclick = async () => {
         incomingModal.style.display = 'none';
         callType = offer.media || 'audio';
         currentCallId = offer.callId || `${Date.now()}_${callerId}_${currentUserId}`;
         currentCallPeer = callerId;
-        // mark that we're answering (so we are no longer idle)
-        try { await setCallState(currentUserId, { status: 'in-call', peer: callerId, callId: currentCallId }); } catch(e){}
+
+        // mark answering (temporarily) so others see us busy
+        try { await setCallState(currentUserId, { status: 'answering', peer: callerId, callId: currentCallId }); } catch(e){}
 
         try {
           if (callType === 'audio') localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           else localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         } catch (e) {
           alert('Need mic/cam permission to answer: ' + e.message);
-          await remove(ref(db, `incoming/${currentUserId}`));
-          // reset callState back to idle
+          try { await remove(ref(db, `incoming/${currentUserId}`)); } catch(e){}
           try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
           return;
         }
 
-        // preview
+        // preview (stay visible)
         showPreviewArea(callType);
 
         // create pc and add local
@@ -790,7 +823,7 @@
         hangupCallBtn.style.display = 'flex';
         document.getElementById('chatView').style.display = 'block';
 
-        // clear caller side timeout (caller will also see connected status)
+        // clear any caller-side timeout (caller will see connected status too)
         if (callTimeoutHandle) { clearTimeout(callTimeoutHandle); callTimeoutHandle = null; }
       };
 
@@ -799,7 +832,6 @@
         incomingModal.style.display = 'none';
         try { await remove(ref(db, `incoming/${currentUserId}`)); } catch(e){}
         try { await update(ref(db, `calls/${offer.callId}`), { status: 'rejected' }); } catch(e){}
-        // ensure our callState is idle
         try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
       };
     });
@@ -828,7 +860,7 @@
     }
   }
 
-  // local cleanup after call ended (flag writes to DB done elsewhere)
+  // local cleanup after call ended (removeSignaling true if we should remove DB nodes)
   async function localCleanupAfterCall(removeSignaling/*true if this side should attempt to remove signaling nodes*/) {
     // clear timeout
     if (callTimeoutHandle) { clearTimeout(callTimeoutHandle); callTimeoutHandle = null; }
@@ -840,10 +872,12 @@
     callPreview.style.display = 'none';
     hangupCallBtn.style.display = 'none';
     callBar.style.display = 'flex';
+    incomingModal.style.display = 'none';
     // detach per-call listeners
-    if (answerRef) { off(answerRef); answerRef = null; }
-    if (remoteCandidatesRef) { off(remoteCandidatesRef); remoteCandidatesRef = null; }
-    if (callStatusRef) { off(callStatusRef); callStatusRef = null; }
+    safeUnsub(answerRefUnsub); answerRefUnsub = null;
+    safeUnsub(remoteCandidatesUnsub); remoteCandidatesUnsub = null;
+    safeUnsub(callStatusUnsub); callStatusUnsub = null;
+
     // optionally remove signaling nodes (incoming/answers) to clean DB if requested
     if (removeSignaling && currentCallId) {
       try { await remove(ref(db, `calls/${currentCallId}`)); } catch(e){}
@@ -854,20 +888,21 @@
       }
       try { await remove(ref(db, `answers/${currentUserId}/${currentCallPeer}`)); } catch(e){}
       try { await remove(ref(db, `answers/${currentCallPeer}/${currentUserId}`)); } catch(e){}
-      // remove candidate children optionally (not required)
       try { await remove(ref(db, `candidates/${currentUserId}/${currentCallPeer}`)); } catch(e){}
       try { await remove(ref(db, `candidates/${currentCallPeer}/${currentUserId}`)); } catch(e){}
       // reset callState for both sides
       try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
       if (currentCallPeer) try { await setCallState(currentCallPeer, { status: 'idle' }); } catch(e){}
     } else {
-      // when remote signalled end, still ensure our callState is idle
+      // ensure our callState is idle
       try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
     }
+
     // clear call id after cleanup
     currentCallId = null;
     currentCallPeer = null;
     callType = null;
+    currentIncomingOfferId = null;
   }
 
   // hangup (user pressed hang button) -> announce ended and cleanup locally
@@ -889,14 +924,11 @@
   videoCallHalf.onclick = () => startCall('video');
   hangupCallBtn.onclick = () => hangupCall();
 
-  // ensure incoming listener remains attached after login; don't remove it during calls
-  // note: startIncomingListener() is called from loginUser()
-
   // cleanup on leaving page
   window.addEventListener('beforeunload', async () => {
     try { if (pc) pc.close(); } catch(e){}
     // If leaving while in a call, mark call ended to notify peer and try to clean up
-  if (currentCallId) {
+    if (currentCallId) {
       try { await update(ref(db, `calls/${currentCallId}`), { status: 'ended' }); } catch(e){}
       try { await remove(ref(db, `incoming/${currentCallPeer || currentUserId}`)); } catch(e){}
     }
